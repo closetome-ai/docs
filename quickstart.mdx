@@ -1,80 +1,226 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Getting Started
+description: Understanding Closetome's core concepts and architecture
+icon: "rocket"
 ---
 
-## Get started in three steps
+## Overview
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+Closetome is a **permissionless** enhanced X402 endpoint that requires no API keys or registration to use. Anyone can submit transactions to the network and benefit from atomic execution guarantees.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Closetome is currently under active development. SDK and implementation details will be available soon.
 </Note>
+
+## Key Concepts
+
+### Permissionless Design
+
+Unlike traditional payment gateways, Closetome operates as a completely open protocol:
+
+- **No API Keys Required**: Submit transactions directly to the network
+- **No Registration Process**: Start using immediately without signup
+- **Open Network**: Anyone can participate as a user or Facilitator
+- **Transparent Operations**: All transactions and fees are publicly visible
+
+### How It Works
+
+<Steps>
+  <Step title="Transaction Submission">
+    Submit your X402 payment transaction to any Closetome endpoint
+  </Step>
+  <Step title="Atomic Execution">
+    Smart contracts ensure payment and callback execute atomically
+  </Step>
+  <Step title="Automatic Routing">
+    Transactions are routed to optimal Facilitators via the mempool
+  </Step>
+  <Step title="Settlement">
+    Everything settles in a single blockchain transaction
+  </Step>
+</Steps>
+
+## Architecture Components
+
+### 1. Atomic Endpoint
+
+The core innovation that solves X402's consistency problems:
+
+```
+Standard X402:  Payment → Validation → Settlement (2 phases, 2 transactions)
+Closetome:      Payment + Callback → Atomic Execution (1 phase, 1 transaction)
+```
+
+### 2. Decentralized Mempool
+
+A public transaction pool where Facilitators compete to process transactions:
+
+- **Market-based fees**: Facilitators set their own rates
+- **Performance-based routing**: Better performing nodes get more traffic
+- **No central coordinator**: Fully decentralized operation
+
+### 3. MCP Server Integration
+
+Model Context Protocol server providing AI Agents with DeFi capabilities:
+
+- Swap tokens across DEXs
+- Manage liquidity positions
+- Execute lending strategies
+- Bridge assets cross-chain
+
+## Use Cases
+
+### AI Agent Payments
+
+AI Agents can use Closetome to:
+- Pay for API services atomically
+- Execute DeFi strategies with payment guarantees
+- Manage treasury operations safely
+
+### Micropayment APIs
+
+Service providers can:
+- Charge per-request without payment risk
+- Implement usage-based pricing models
+- Ensure payment atomicity for critical operations
+
+### DeFi Automation
+
+Automated systems can:
+- Execute complex multi-step transactions atomically
+- Ensure all operations succeed or all fail
+- Eliminate partial execution risks
+
+## Network Participation
+
+### As a User
+
+Simply submit transactions to any Closetome endpoint:
+
+```
+POST https://endpoint.closetome.io/atomic
+Content-Type: application/json
+
+{
+  "payment": {
+    "amount": "1000000000000000",
+    "token": "ETH",
+    "recipient": "0x..."
+  },
+  "callback": {
+    "contract": "0x...",
+    "method": "processPayment",
+    "params": [...]
+  }
+}
+```
+
+### As a Facilitator
+
+Join the network to process transactions and earn fees:
+
+1. **Stake tokens** to join the Facilitator registry
+2. **Run a node** to process transactions
+3. **Earn fees** based on performance and reliability
+
+<Info>
+Facilitator implementation guide coming soon. Join our GitHub for updates.
+</Info>
+
+## Technical Specifications
+
+### Smart Contract Interface
+
+```solidity
+interface IAtomicX402 {
+    // Core atomic execution function
+    function executeAtomic(
+        PaymentInfo calldata payment,
+        CallbackInfo calldata callback
+    ) external returns (bytes memory);
+
+    // Batch operations for efficiency
+    function executeBatch(
+        PaymentInfo[] calldata payments,
+        CallbackInfo[] calldata callbacks
+    ) external returns (bytes[] memory);
+}
+```
+
+### Transaction Format
+
+All transactions follow the standard X402 format with Closetome extensions:
+
+```json
+{
+  "version": "1.0",
+  "payment": {
+    // Standard X402 payment fields
+  },
+  "callback": {
+    // Closetome atomic callback specification
+  },
+  "routing": {
+    // Optional: Facilitator preferences
+  }
+}
+```
+
+## Security Considerations
+
+### Smart Contract Security
+
+- All contracts are audited and formally verified
+- Reentrancy protection on all functions
+- Comprehensive test coverage
+
+### Economic Security
+
+- Facilitators must stake tokens to participate
+- Slashing for malicious behavior
+- Fee market ensures competitive pricing
+
+### Network Security
+
+- Decentralized architecture prevents single points of failure
+- Transparent mempool prevents censorship
+- Open source code for community verification
+
+## Coming Soon
+
+<CardGroup cols={2}>
+  <Card
+    title="SDK Release"
+    icon="code"
+  >
+    JavaScript/TypeScript SDK for easy integration (In Development)
+  </Card>
+  <Card
+    title="Facilitator Tools"
+    icon="server"
+  >
+    Complete toolkit for running Facilitator nodes (Coming Soon)
+  </Card>
+  <Card
+    title="Testnet Launch"
+    icon="flask"
+  >
+    Public testnet for developers to experiment (Q1 2025)
+  </Card>
+  <Card
+    title="Mainnet Deployment"
+    icon="rocket"
+  >
+    Production deployment on Ethereum mainnet (Q2 2025)
+  </Card>
+</CardGroup>
+
+## Resources
+
+<Card
+  title="GitHub Repository"
+  icon="github"
+  href="https://github.com/closetome-ai"
+>
+  Follow our development progress and contribute
+</Card>

@@ -1,33 +1,350 @@
 ---
-title: 'Introduction'
-description: 'Example section for showcasing API endpoints'
+title: API Reference
+description: Closetome Protocol Specifications and Interfaces
+icon: "code"
 ---
 
+## Overview
+
+Closetome provides a **permissionless** enhanced X402 endpoint that requires no API keys or registration. This document describes the protocol specifications and interfaces.
+
 <Note>
-  If you're not looking to build API reference documentation, you can delete
-  this section by removing the api-reference folder.
+The SDK and implementation details are currently under development. This reference describes the planned API design.
 </Note>
 
-## Welcome
+## Protocol Design Principles
 
-There are two ways to build API documentation: [OpenAPI](https://mintlify.com/docs/api-playground/openapi/setup) and [MDX components](https://mintlify.com/docs/api-playground/mdx/configuration). For the starter kit, we are using the following OpenAPI specification.
+### Permissionless Access
 
-<Card
-  title="Plant Store Endpoints"
-  icon="leaf"
-  href="https://github.com/mintlify/starter/blob/main/api-reference/openapi.json"
->
-  View the OpenAPI specification file
-</Card>
+- **No API Keys**: Submit transactions directly without authentication
+- **No Registration**: Start using immediately without signup
+- **Open Protocol**: Anyone can participate as user or Facilitator
+- **Transparent Fees**: All fees are visible on-chain
 
-## Authentication
+### Atomic Execution
 
-All API endpoints are authenticated using Bearer tokens and picked up from the specification file.
+- **Single Transaction**: Payment and callback in one atomic operation
+- **All or Nothing**: Complete success or complete revert
+- **No Partial States**: Eliminates consistency issues
+
+## Core Endpoints
+
+### Atomic Transaction Submission
+
+Submit X402 transactions with atomic execution guarantees:
+
+```
+POST https://endpoint.closetome.io/atomic
+Content-Type: application/json
+
+{
+  "payment": {
+    "amount": "1000000000000000",
+    "token": "ETH",
+    "from": "0x...",
+    "to": "0x...",
+    "nonce": 123456,
+    "signature": "0x..."
+  },
+  "callback": {
+    "contract": "0x...",
+    "method": "processPayment",
+    "params": ["param1", "param2"],
+    "gasLimit": 500000
+  }
+}
+```
+
+### Transaction Status Query
+
+Check transaction status and results:
+
+```
+GET https://endpoint.closetome.io/status/{txHash}
+
+Response:
+{
+  "status": "success" | "pending" | "failed",
+  "transactionHash": "0x...",
+  "blockNumber": 12345678,
+  "gasUsed": "250000",
+  "result": "0x..."
+}
+```
+
+## Smart Contract Interfaces
+
+### IAtomicX402
+
+Core interface for atomic X402 execution:
+
+```solidity
+interface IAtomicX402 {
+    struct PaymentInfo {
+        address token;
+        address from;
+        address to;
+        uint256 amount;
+        uint256 nonce;
+        bytes signature;
+    }
+
+    struct CallbackInfo {
+        address target;
+        bytes data;
+        uint256 gasLimit;
+    }
+
+    // Execute atomic payment + callback
+    function executeAtomic(
+        PaymentInfo calldata payment,
+        CallbackInfo calldata callback
+    ) external returns (bytes memory);
+
+    // Batch atomic operations
+    function executeBatch(
+        PaymentInfo[] calldata payments,
+        CallbackInfo[] calldata callbacks
+    ) external returns (bytes[] memory);
+
+    // Events
+    event AtomicExecuted(
+        address indexed payer,
+        address indexed recipient,
+        uint256 amount,
+        bytes32 indexed txHash
+    );
+}
+```
+
+### IFacilitatorRegistry
+
+Interface for Facilitator management:
+
+```solidity
+interface IFacilitatorRegistry {
+    // Register as Facilitator (requires $CLOSETOME tokens)
+    function register(
+        string calldata endpoint,
+        uint256 feeRate,
+        uint256 capacity
+    ) external;
+
+    // Update Facilitator settings
+    function updateSettings(
+        uint256 feeRate,
+        uint256 capacity
+    ) external;
+
+    // Withdraw stake (7-day unstaking period)
+    function withdraw() external;
+
+    // Query Facilitator info
+    function getFacilitator(address addr)
+        external view returns (
+            string memory endpoint,
+            uint256 stake,
+            uint256 feeRate,
+            bool active
+        );
+}
+```
+
+## Transaction Format
+
+### X402 Payment Header
+
+Standard X402 payment information:
 
 ```json
-"security": [
-  {
-    "bearerAuth": []
-  }
-]
+{
+  "version": "1.0",
+  "chain": "ethereum",
+  "token": "ETH",
+  "amount": "1000000000000000",
+  "from": "0x...",
+  "to": "0x...",
+  "nonce": 123456,
+  "timestamp": 1234567890,
+  "signature": "0x..."
+}
 ```
+
+### Callback Specification
+
+Define on-chain operations to execute atomically with payment:
+
+```json
+{
+  "contract": "0x...",
+  "method": "methodName",
+  "params": ["param1", "param2"],
+  "gasLimit": 500000,
+  "value": "0"
+}
+```
+
+## Network Participation
+
+### As a User
+
+Submit transactions to any Closetome endpoint:
+
+1. **Prepare Payment**: Create and sign payment data
+2. **Define Callback**: Specify on-chain operation
+3. **Submit Transaction**: Send to Closetome endpoint
+4. **Monitor Status**: Track transaction completion
+
+### As a Facilitator
+
+Process transactions and earn fees:
+
+1. **Stake $CLOSETOME**: Lock $CLOSETOME tokens in registry (7-day unstaking period)
+2. **Register Endpoint**: Provide service URL
+3. **Process Transactions**: Handle from mempool
+4. **Earn Rewards**: Receive processing fees
+
+## Security Specifications
+
+### Signature Verification
+
+All payments must be properly signed:
+
+```solidity
+function verifySignature(
+    PaymentInfo memory payment
+) internal pure returns (bool) {
+    bytes32 message = keccak256(abi.encodePacked(
+        payment.token,
+        payment.from,
+        payment.to,
+        payment.amount,
+        payment.nonce
+    ));
+
+    address signer = ECDSA.recover(
+        ECDSA.toEthSignedMessageHash(message),
+        payment.signature
+    );
+
+    return signer == payment.from;
+}
+```
+
+### Nonce Management
+
+Prevent replay attacks:
+
+- Each payment must use a unique nonce
+- Nonces are tracked per address
+- Used nonces cannot be reused
+
+### Gas Limit Protection
+
+Callbacks execute with specified gas limits:
+
+- Default: 500,000 gas
+- Maximum: 2,000,000 gas
+- Excess gas is refunded
+
+## Error Codes
+
+| Code | Description |
+|------|-------------|
+| `INVALID_SIGNATURE` | Payment signature verification failed |
+| `INSUFFICIENT_BALANCE` | Payer has insufficient token balance |
+| `NONCE_ALREADY_USED` | Payment nonce has been used |
+| `CALLBACK_FAILED` | Callback execution reverted |
+| `GAS_LIMIT_EXCEEDED` | Operation exceeded gas limit |
+| `INVALID_TOKEN` | Unsupported token address |
+
+## Events and Monitoring
+
+### Contract Events
+
+Monitor on-chain activity:
+
+```solidity
+event AtomicExecuted(
+    address indexed payer,
+    address indexed recipient,
+    uint256 amount,
+    address callbackTarget,
+    bool success,
+    bytes32 indexed txHash
+);
+
+event FacilitatorRegistered(
+    address indexed facilitator,
+    string endpoint,
+    uint256 stake
+);
+
+event TransactionProcessed(
+    bytes32 indexed txHash,
+    address indexed facilitator,
+    uint256 fee
+);
+```
+
+### Off-chain Monitoring
+
+Track network statistics:
+
+- Active Facilitators count
+- Transaction volume (24h)
+- Average fee rates
+- Success/failure rates
+- Network congestion levels
+
+## Planned Features
+
+### Coming Soon
+
+- **WebSocket Subscriptions**: Real-time transaction updates
+- **Batch Operations API**: Submit multiple transactions
+- **Analytics API**: Query network statistics
+- **Facilitator API**: Detailed Facilitator metrics
+
+### Future Enhancements
+
+- Cross-chain transaction support
+- Zero-knowledge proof integration
+- Advanced routing algorithms
+- Custom fee models
+
+## Migration from Standard X402
+
+### Compatibility
+
+Closetome is designed to be backward compatible:
+
+- Standard X402 clients work without modification
+- Existing payment formats are supported
+- No changes needed to client-side code
+
+### Benefits of Migration
+
+- **Atomicity**: Eliminate partial execution risks
+- **Reliability**: Decentralized Facilitator network
+- **Performance**: Optimized transaction routing
+- **Cost**: Competitive market-based fees
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card
+    title="GitHub Repository"
+    icon="github"
+    href="https://github.com/closetome-ai"
+  >
+    View source code and examples
+  </Card>
+  <Card
+    title="Technical Whitepaper"
+    icon="file"
+    href="https://github.com/closetome-ai/whitepaper"
+  >
+    Read the technical specifications
+  </Card>
+</CardGroup>

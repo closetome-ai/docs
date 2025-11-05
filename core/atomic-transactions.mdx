@@ -1,0 +1,310 @@
+---
+title: Atomic Transactions
+description: Understanding how Closetome solves X402's atomicity problem
+icon: "lock"
+---
+
+## Background: X402's Atomicity Challenge
+
+The standard X402 protocol uses a two-phase commit model:
+
+<Steps>
+  <Step title="Validation Phase">
+    Client sends payment credentials to server for verification
+  </Step>
+  <Step title="Settlement Phase">
+    Facilitator submits the transaction to the blockchain
+  </Step>
+</Steps>
+
+This design creates serious **race condition** issues:
+
+<Warning>
+Between the two phases, payment and callback transactions can become inconsistent:
+- Payment succeeds but server callback fails → User loses funds
+- Callback succeeds but payment fails → Service provider loses
+</Warning>
+
+## Closetome's Solution
+
+### Single Transaction Atomicity
+
+Closetome merges validation and settlement into a **single on-chain transaction** through smart contracts:
+
+```solidity
+contract AtomicX402 {
+    function executeAtomic(
+        PaymentData payment,
+        CallbackData callback
+    ) external {
+        // 1. Validate payment
+        require(verifyPayment(payment), "Invalid payment");
+
+        // 2. Execute payment transfer
+        transferFrom(payment.from, payment.to, payment.amount);
+
+        // 3. Execute callback operation
+        (bool success, ) = callback.target.call(callback.data);
+        require(success, "Callback failed");
+
+        // All operations complete in one transaction
+        // Either all succeed or all revert
+    }
+}
+```
+
+### Technical Architecture
+
+<Tabs>
+  <Tab title="Architecture Diagram">
+    ```mermaid
+    sequenceDiagram
+        participant C as Client
+        participant S as Server
+        participant CS as Closetome Smart Contract
+        participant B as Blockchain
+
+        C->>S: HTTP Request + X402 Header
+        S->>CS: Prepare Atomic Transaction
+        CS->>B: Single Transaction
+        Note over B: Payment + Callback
+        B-->>CS: Success/Revert
+        CS-->>S: Transaction Result
+        S-->>C: HTTP Response
+    ```
+  </Tab>
+  <Tab title="Comparison with Standard X402">
+    ```mermaid
+    sequenceDiagram
+        participant C as Client
+        participant S as Server
+        participant F as Facilitator
+        participant B as Blockchain
+
+        C->>S: HTTP Request + X402 Header
+        S->>F: Verify Payment (Phase 1)
+        F-->>S: Verification Result
+        S->>F: Submit Payment (Phase 2)
+        F->>B: Transaction 1
+        B-->>F: Success
+        S->>B: Transaction 2 (Callback)
+        Note over B: Two separate transactions, potential inconsistency
+    ```
+  </Tab>
+</Tabs>
+
+## Implementation Details
+
+### Smart Contract Interface
+
+```solidity
+interface IAtomicX402 {
+    struct PaymentInfo {
+        address token;
+        address from;
+        address to;
+        uint256 amount;
+        uint256 nonce;
+        bytes signature;
+    }
+
+    struct CallbackInfo {
+        address target;
+        bytes data;
+        uint256 gasLimit;
+    }
+
+    // Core atomic execution function
+    function executeAtomic(
+        PaymentInfo calldata payment,
+        CallbackInfo calldata callback
+    ) external returns (bytes memory);
+
+    // Batch atomic operations
+    function executeBatch(
+        PaymentInfo[] calldata payments,
+        CallbackInfo[] calldata callbacks
+    ) external returns (bytes[] memory);
+}
+```
+
+### Transaction Flow
+
+1. **Client initiates payment** with X402 headers
+2. **Server prepares atomic transaction** including callback
+3. **Smart contract executes atomically**:
+   - Validates payment signature
+   - Transfers funds
+   - Executes callback
+4. **All succeed or all revert** - no partial execution
+
+## Advantages
+
+### 1. Strong Consistency Guarantee
+
+<CardGroup cols={2}>
+  <Card title="Standard X402" icon="xmark" color="#ef4444">
+    - Two-phase commit
+    - Possible partial success
+    - Complex compensation logic needed
+    - Funds can be locked
+  </Card>
+  <Card title="Closetome" icon="check" color="#10b981">
+    - Single transaction execution
+    - All or nothing guarantee
+    - No compensation needed
+    - Fund safety assured
+  </Card>
+</CardGroup>
+
+### 2. Performance Optimization
+
+Batch operations in a single transaction significantly reduce gas costs:
+
+```solidity
+// Process multiple atomic operations efficiently
+function executeBatch(
+    PaymentInfo[] calldata payments,
+    CallbackInfo[] calldata callbacks
+) external returns (bytes[] memory results) {
+    require(payments.length == callbacks.length, "Mismatched arrays");
+
+    results = new bytes[](payments.length);
+    for (uint i = 0; i < payments.length; i++) {
+        // Each operation is atomic
+        // But all are processed in one transaction
+        results[i] = _executeAtomic(payments[i], callbacks[i]);
+    }
+}
+```
+
+### 3. Backward Compatibility
+
+Closetome is fully compatible with standard X402 clients - no client-side changes needed.
+
+## Security Considerations
+
+### Reentrancy Protection
+
+```solidity
+contract AtomicX402 {
+    uint256 private locked;
+
+    modifier nonReentrant() {
+        require(locked == 0, "Reentrant call");
+        locked = 1;
+        _;
+        locked = 0;
+    }
+
+    function executeAtomic(...) external nonReentrant {
+        // Atomic execution protected from reentrancy
+    }
+}
+```
+
+### Signature Verification
+
+```solidity
+function verifyPayment(PaymentInfo memory payment)
+    internal view returns (bool) {
+    bytes32 message = keccak256(abi.encodePacked(
+        payment.token,
+        payment.from,
+        payment.to,
+        payment.amount,
+        payment.nonce
+    ));
+
+    address signer = ECDSA.recover(message, payment.signature);
+    return signer == payment.from && !usedNonces[payment.nonce];
+}
+```
+
+### Gas Limit Protection
+
+Callbacks are executed with gas limits to prevent DoS attacks:
+
+```solidity
+(bool success, bytes memory result) = callback.target.call{
+    gas: callback.gasLimit
+}(callback.data);
+
+require(success, "Callback execution failed");
+```
+
+## Use Cases
+
+### DeFi Protocol Integration
+
+Combine payment with DEX swaps atomically:
+
+- User pays protocol fee
+- Protocol executes swap
+- Both succeed or both fail
+
+### NFT Marketplaces
+
+Atomic NFT purchases with royalty distribution:
+
+- Buyer pays seller
+- NFT transfers to buyer
+- Royalties distributed to creators
+- All in one atomic transaction
+
+### Subscription Services
+
+Activate subscriptions atomically with payment:
+
+- User pays subscription fee
+- Service activates user access
+- No risk of payment without activation
+
+## Monitoring and Events
+
+### Event Logging
+
+```solidity
+event AtomicExecuted(
+    address indexed payer,
+    address indexed recipient,
+    uint256 amount,
+    address callbackTarget,
+    bool success,
+    bytes32 indexed txHash
+);
+```
+
+### Transaction Tracking
+
+Monitor atomic transaction success rates and patterns:
+
+```solidity
+struct AtomicStats {
+    uint256 totalExecuted;
+    uint256 totalVolume;
+    uint256 successCount;
+    uint256 failureCount;
+}
+```
+
+## Summary
+
+Closetome's atomic transaction mechanism completely solves the consistency issues of standard X402, providing a solid foundation for building reliable on-chain payment applications.
+
+<CardGroup cols={2}>
+  <Card
+    title="Facilitator Mempool"
+    icon="scale-balanced"
+    href="/core/facilitator-pool"
+  >
+    Learn about decentralized load balancing
+  </Card>
+  <Card
+    title="Technical Architecture"
+    icon="diagram-project"
+    href="/architecture"
+  >
+    Explore the complete system design
+  </Card>
+</CardGroup>
