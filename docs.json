@@ -24,12 +24,15 @@
             "group": "Core Concepts",
             "pages": [
               "core/atomic-transactions",
+              "core/atomic-implementation",
               "core/facilitator-pool"
             ]
           },
           {
             "group": "Integration",
             "pages": [
+              "integration/facilitator-setup",
+              "integration/sdk-guide",
               "integration/mcp-server"
             ]
           }

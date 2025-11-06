@@ -1,0 +1,528 @@
+---
+title: Atomic Transaction Implementation
+description: Deep dive into Closetome's atomic payment architecture on Solana
+icon: "code"
+---
+
+## Overview
+
+Closetome implements atomic transactions by combining payment and callback operations into a **single Solana transaction**. This eliminates the two-phase commit problem inherent in standard X402 protocol implementations.
+
+## Standard vs Atomic X402
+
+### Standard X402 Flow (Two Transactions)
+
+```
+1. Client creates payment transaction
+2. Client submits to facilitator → Transaction 1
+3. Facilitator verifies payment
+4. Facilitator executes callback → Transaction 2 (separate!)
+```
+
+**Problem**: Payment and callback are in different transactions. If the callback transaction fails or is censored, payment is already settled but the service is not delivered.
+
+### Closetome Atomic Flow (Single Transaction)
+
+```
+1. Client requests endpoint → Receives 402 with callback instructions
+2. Client creates transaction with:
+   - Compute budget instructions
+   - Payment transfer instruction
+   - Callback instructions (from server)
+3. Client signs transaction
+4. Facilitator verifies all instructions
+5. Facilitator co-signs transaction
+6. Single transaction submitted → All or nothing execution
+```
+
+**Solution**: Payment and callback are in the **same transaction**. Either both succeed atomically, or both fail and revert.
+
+## Transaction Structure
+
+Every atomic transaction follows this exact structure:
+
+```
+┌─────────────────────────────────────────┐
+│ Instruction 0: SetComputeUnitPrice      │ ← Compute budget
+├─────────────────────────────────────────┤
+│ Instruction 1: SetComputeUnitLimit      │ ← Compute budget
+├─────────────────────────────────────────┤
+│ Instruction 2: CreateATA (optional)     │ ← Payment setup
+├─────────────────────────────────────────┤
+│ Instruction 3: USDC Transfer            │ ← Payment execution
+├─────────────────────────────────────────┤
+│ Instruction 4+: Callback Instructions   │ ← Server operations
+│                 (Memo, custom programs)  │
+└─────────────────────────────────────────┘
+```
+
+## Implementation Architecture
+
+### 1. Client Flow ([client.ts](https://github.com/closetome-ai/closetome-facilitator/blob/main/solana-sdk/src/client.ts))
+
+#### Step 1: Discover API Schema
+
+When a client first requests a protected endpoint, they receive a 402 response with:
+- Payment requirements (amount, recipient)
+- **Input schema** for parameter discovery
+- **Callback instructions** template
+
+```typescript
+// Initial 402 response includes schema
+{
+  "x402Version": 1,
+  "accepts": [{
+    "maxAmountRequired": "1000000",
+    "payTo": "Server...",
+    "outputSchema": {
+      "input": {
+        "properties": {
+          "amount": { "type": "number", "description": "..." },
+          "message": { "type": "string", "description": "..." }
+        }
+      }
+    }
+  }]
+}
+```
+
+#### Step 2: Security Validation
+
+Before creating the transaction, the SDK validates callback instructions:
+
+```typescript
+// solana-sdk/src/client.ts:221-234
+private validateCallbackInstructions(callbackInstructions: SerializedInstruction[]): void {
+  const userWallet = this.payer.publicKey.toBase58()
+
+  for (const instruction of callbackInstructions) {
+    for (const key of instruction.keys) {
+      if (key.pubkey === userWallet) {
+        throw new Error(
+          'Security violation: Callback instruction contains user wallet. ' +
+          'This could allow server to access your funds.'
+        )
+      }
+    }
+  }
+}
+```
+
+**Critical security check**: Ensures server cannot include user's wallet in callback instructions, preventing fund theft.
+
+#### Step 3: Build Atomic Transaction
+
+```typescript
+// solana-sdk/src/client.ts:254-356
+async createAtomicPaymentTransaction(requirements: PaymentRequirements): Promise<string> {
+  // 1. Validate callback instructions (security)
+  this.validateCallbackInstructions(requirements.extra.callbackInstructions)
+
+  // 2. Build payment instructions
+  const instructions = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: computePrice }),
+    ComputeBudgetProgram.setComputeUnitLimit({ units: computeLimit }),
+    // Optional: createAssociatedTokenAccountInstruction if needed
+    createTransferInstruction(payerATA, recipientATA, payer, amount)
+  ]
+
+  // 3. Append callback instructions from server
+  const callbackInstructions = this.deserializeCallbackInstructions(
+    requirements.extra.callbackInstructions
+  )
+  instructions.push(...callbackInstructions)
+
+  // 4. Create versioned transaction
+  const transaction = new VersionedTransaction(messageV0)
+
+  // 5. User signs (server will co-sign later)
+  transaction.sign([this.payer])
+
+  return Buffer.from(transaction.serialize()).toString('base64')
+}
+```
+
+### 2. Facilitator Verification ([solanaService.ts](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts))
+
+#### Step 1: Parse Transaction Structure
+
+```typescript
+// facilitator/src/services/solanaService.ts:680-707
+async verifyAtomicPayment(
+  paymentPayload: PaymentPayload,
+  requirements: PaymentRequirements
+): Promise<boolean> {
+  // Deserialize transaction
+  const transactionBuffer = Buffer.from(svmPayload.transaction, 'base64')
+  const transaction = VersionedTransaction.deserialize(transactionBuffer)
+  const instructions = this.decompileInstructions(transaction.message)
+```
+
+#### Step 2: Validate Compute Budget
+
+```typescript
+// Check compute unit limit doesn't exceed maximum
+// facilitator/src/services/solanaService.ts:709-748
+const maxAllowedLimit = this.maxComputeUnitLimitAtomic // Default: 1,000,000
+
+if (foundUnitLimit > maxAllowedLimit) {
+  console.error('Compute unit limit exceeds maximum for atomic transactions')
+  console.error('This protects users from malicious servers burning their SOL')
+  return false
+}
+```
+
+**Anti-griefing protection**: Prevents malicious servers from adding excessive callback instructions that would burn user's SOL in gas fees.
+
+#### Step 3: Validate Payment Instructions
+
+```typescript
+// facilitator/src/services/solanaService.ts:752-852
+// Verify:
+// 1. USDC transfer amount matches requirements
+// 2. Transfer destination matches payTo address
+// 3. ATA creation (if needed) is valid
+// 4. No instruction order violations
+```
+
+#### Step 4: Verify Callback Instructions Match Exactly
+
+```typescript
+// facilitator/src/services/solanaService.ts:854-879
+// Deserialize callback instructions from requirements
+const callbackInstructions = this.deserializeCallbackInstructions(
+  requirements.extra.callbackInstructions
+)
+
+// Verify each callback instruction exists in transaction
+for (const callbackIx of callbackInstructions) {
+  let found = false
+  for (const txIx of instructions) {
+    if (this.instructionsEqual(callbackIx, txIx)) {
+      found = true
+      break
+    }
+  }
+  if (!found) {
+    return false // Missing callback instruction
+  }
+}
+```
+
+#### Step 5: Validate Instruction Order
+
+```typescript
+// facilitator/src/services/solanaService.ts:881-955
+// Expected structure:
+// [0-1] Compute budget instructions
+// [2]   Optional ATA creation
+// [3]   USDC transfer
+// [4+]  Callback instructions (must match exactly)
+
+const remainingInstructions = instructions.slice(currentIndex)
+
+if (remainingInstructions.length !== callbackInstructions.length) {
+  console.error('Callback instruction count mismatch')
+  return false
+}
+
+// Verify each remaining instruction matches callback exactly
+for (let i = 0; i < remainingInstructions.length; i++) {
+  if (!this.instructionsEqual(remainingInstructions[i], callbackInstructions[i])) {
+    console.error('Callback instruction mismatch at index', i)
+    return false
+  }
+}
+```
+
+### 3. Facilitator Settlement ([solanaService.ts](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts))
+
+```typescript
+// facilitator/src/services/solanaService.ts:969-1038
+async settleAtomicPayment(
+  paymentPayload: PaymentPayload,
+  requirements: PaymentRequirements
+): Promise<{ success: boolean; transactionHash?: string; error?: string }> {
+  // 1. Verify transaction first
+  const isValid = await this.verifyAtomicPayment(paymentPayload, requirements)
+  if (!isValid) {
+    return { success: false, error: 'Verification failed' }
+  }
+
+  // 2. Parse transaction
+  const transaction = VersionedTransaction.deserialize(transactionBuffer)
+
+  // 3. Co-sign with facilitator keypair
+  if (this.feePayerKeypair) {
+    transaction.sign([this.feePayerKeypair])
+    console.log('Transaction signed by facilitator')
+  }
+
+  // 4. Submit to Solana network
+  const signature = await this.connection.sendTransaction(transaction, {
+    skipPreflight: false,
+    preflightCommitment: 'confirmed'
+  })
+
+  // 5. Wait for confirmation
+  const confirmation = await this.connection.confirmTransaction({
+    signature,
+    blockhash: latestBlockhash.blockhash,
+    lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+  })
+
+  return {
+    success: true,
+    transactionHash: signature
+  }
+}
+```
+
+## Security Mechanisms
+
+### 1. Client-Side Protection
+
+**Callback Instruction Validation** ([client.ts:221-234](https://github.com/closetome-ai/closetome-facilitator/blob/main/solana-sdk/src/client.ts#L221-L234))
+
+```typescript
+// Prevents server from including user's wallet in callbacks
+// This stops malicious servers from stealing funds
+if (key.pubkey === userWallet) {
+  throw new Error('Security violation: Callback contains user wallet')
+}
+```
+
+### 2. Facilitator-Side Protection
+
+**Compute Unit Limit Enforcement** ([solanaService.ts:709-748](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts#L709-L748))
+
+```typescript
+// Prevents servers from burning user's SOL with excessive instructions
+if (foundUnitLimit > maxAllowedLimit) {
+  return false // Default max: 1,000,000 compute units
+}
+```
+
+**Instruction Order Validation** ([solanaService.ts:881-955](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts#L881-L955))
+
+```typescript
+// Ensures transaction structure matches expected pattern:
+// 1. Compute budget (2 instructions)
+// 2. Optional ATA creation (1 instruction)
+// 3. Payment transfer (1 instruction)
+// 4. Callback instructions (N instructions, exact match required)
+```
+
+**Callback Instruction Matching** ([solanaService.ts:646-675](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts#L646-L675))
+
+```typescript
+// Compares instructions accounting for Solana's signature quirks
+// Non-signer accounts: Must match isWritable exactly
+// Signer accounts: isWritable is always true (Solana enforces this)
+if (!key1.isSigner && !key2.isSigner) {
+  if (key1.isWritable !== key2.isWritable) return false
+}
+```
+
+## Type-Safe Route Definitions
+
+Closetome provides a schema-based system for defining atomic endpoints with full type safety:
+
+```typescript
+// examples/server/server.ts:116-219
+const atomicPremiumRoute = defineRoute<AtomicPremiumInput, AtomicPremiumOutput>({
+  method: 'GET',
+  path: '/api/atomic/premium',
+  atomic: true,      // Enable atomic verification
+  autoSettle: true,  // Automatically settle after verification
+
+  // INPUT SCHEMA - Defines parameters for clients
+  inputSchema: {
+    amount: prop.number('Payment amount in microUSDC'),
+    message: prop.string('Custom message for transaction memo'),
+    premium: prop.string('Premium access flag', { enum: ['true', 'false'] })
+  },
+
+  // OUTPUT SCHEMA - Defines response structure
+  outputSchema: {
+    message: prop.string('Response message'),
+    payment: prop.object({
+      settlementTxHash: prop.string('Transaction hash'),
+      atomic: prop.boolean('Whether transaction was atomic')
+    })
+  },
+
+  // PAYMENT REQUIREMENTS GENERATOR
+  paymentRequirements: ({ input }) => {
+    const amount = input.amount || 1000000
+
+    // Create callback instructions dynamically
+    const callbackInstructions = []
+    callbackInstructions.push(
+      new TransactionInstruction({
+        keys: [{ pubkey: SERVER_ACCOUNT.publicKey, isSigner: true, isWritable: false }],
+        programId: MEMO_PROGRAM_ID,
+        data: Buffer.from(`X402 Atomic: ${input.message}`)
+      })
+    )
+
+    if (input.premium === 'true') {
+      callbackInstructions.push(
+        new TransactionInstruction({
+          keys: [{ pubkey: SERVER_ACCOUNT.publicKey, isSigner: true, isWritable: false }],
+          programId: MEMO_PROGRAM_ID,
+          data: Buffer.from('PREMIUM ACCESS GRANTED')
+        })
+      )
+    }
+
+    return {
+      maxAmountRequired: amount.toString(),
+      payTo: PAYMENT_RECIPIENT,
+      extra: {
+        callbackInstructions: serializeInstructions(callbackInstructions)
+      }
+    }
+  },
+
+  // REQUEST HANDLER - Executed after atomic settlement
+  handler: ({ input, req }) => {
+    const x402Info = req.x402
+    return {
+      message: 'Atomic payment successful!',
+      payment: {
+        settlementTxHash: x402Info.settlementTxHash,
+        atomic: true
+      }
+    }
+  }
+})
+```
+
+## Interactive Client Experience
+
+Atomic clients can discover API parameters interactively:
+
+```typescript
+// examples/client/atomic-client.ts:166-290
+// Step 1: Get initial 402 response to discover schema
+const initialRequirements = await client.getPaymentRequirements(endpoint)
+const inputSchema = initialRequirements.outputSchema.input
+
+// Step 2: Collect user inputs based on schema
+const userInputs = await collectInputFromSchema(inputSchema.properties)
+// → Interactive prompts for amount, message, premium flag
+
+// Step 3: Make second 402 request with parameters
+const finalEndpoint = `${endpoint}?amount=1000000&message=Hello&premium=true`
+const finalRequirements = await client.getPaymentRequirements(finalEndpoint)
+
+// Step 4: Execute atomic payment
+const result = await client.requestWithAtomicPayment(finalEndpoint)
+```
+
+## Key Benefits
+
+### 1. Atomicity Guarantee
+
+Payment and callback execute in a **single Solana transaction**. Either both succeed or both fail atomically.
+
+### 2. No Coordinator Risk
+
+No two-phase commit means no risk of:
+- Coordinator failure between phases
+- Payment succeeding but callback failing
+- Race conditions or inconsistent state
+
+### 3. Security by Design
+
+- Client validates callbacks don't contain their wallet
+- Facilitator enforces compute unit limits
+- Instruction order validation prevents injection attacks
+- Exact instruction matching prevents tampering
+
+### 4. Developer Experience
+
+- Type-safe route definitions with schema generation
+- Interactive parameter discovery for clients
+- Automatic API documentation from schemas
+- Full TypeScript support throughout
+
+## Example Transaction Flow
+
+```
+User: "Access premium API with message 'Hello World'"
+  ↓
+Client: GET /api/atomic/premium (Initial request)
+  ↓
+Server: 402 Payment Required
+  {
+    inputSchema: { amount, message, premium },
+    outputSchema: { ... }
+  }
+  ↓
+Client: Collects input from user
+  amount = 1000000
+  message = "Hello World"
+  premium = "true"
+  ↓
+Client: GET /api/atomic/premium?amount=1000000&message=Hello+World&premium=true
+  ↓
+Server: 402 Payment Required with callback instructions
+  {
+    maxAmountRequired: "1000000",
+    callbackInstructions: [
+      MemoInstruction("X402 Atomic: Hello World"),
+      MemoInstruction("PREMIUM ACCESS GRANTED")
+    ]
+  }
+  ↓
+Client: Creates transaction
+  [SetComputeUnitPrice, SetComputeUnitLimit, USDCTransfer, Memo1, Memo2]
+Client: Signs transaction (user signature)
+  ↓
+Facilitator: Verifies all instructions
+  ✓ Compute budget within limits
+  ✓ Payment amount correct
+  ✓ Callback instructions match exactly
+  ✓ Instruction order valid
+  ↓
+Facilitator: Co-signs transaction (server signature)
+  ↓
+Facilitator: Submits to Solana
+  ↓
+Solana: Executes all instructions atomically
+  ✓ USDC transferred to server
+  ✓ Memos written to blockchain
+  ✓ Single transaction confirmed
+  ↓
+Client: Receives success response with transaction hash
+```
+
+## Source Code Reference
+
+- **Facilitator atomic settlement**: [facilitator/src/routes/atomicSettle.ts](https://github.com/closetome-ai/Closetome/blob/main/facilitator/src/routes/atomicSettle.ts)
+- **Facilitator verification logic**: [facilitator/src/services/solanaService.ts](https://github.com/closetome-ai/Closetome/blob/main/facilitator/src/services/solanaService.ts#L680-L965)
+- **SDK client implementation**: [solana-sdk/src/client.ts](https://github.com/closetome-ai/Closetome/blob/main/solana-sdk/src/client.ts#L254-L356)
+- **Type-safe route system**: [solana-sdk/src/typed-routes.ts](https://github.com/closetome-ai/Closetome/blob/main/solana-sdk/src/typed-routes.ts)
+- **Example server**: [examples/server/server.ts](https://github.com/closetome-ai/Closetome/blob/main/examples/server/server.ts)
+- **Example interactive client**: [examples/client/atomic-client.ts](https://github.com/closetome-ai/Closetome/blob/main/examples/client/atomic-client.ts)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Facilitator Setup"
+    icon="server"
+    href="/integration/facilitator-setup"
+  >
+    Run your own Closetome facilitator
+  </Card>
+  <Card
+    title="SDK Integration"
+    icon="code"
+    href="/integration/sdk-guide"
+  >
+    Integrate atomic payments in your application
+  </Card>
+</CardGroup>

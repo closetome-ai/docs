@@ -1,0 +1,523 @@
+---
+title: Facilitator Setup Guide
+description: Deploy and run a Closetome facilitator node
+icon: "server"
+---
+
+## Overview
+
+A Closetome facilitator is a service that verifies and settles X402 payment transactions. Facilitators earn fees by processing payments and can support both standard and atomic transaction flows.
+
+## Prerequisites
+
+- Node.js 18+ and npm/yarn
+- Solana wallet with SOL for transaction fees
+- (Optional) USDC for testing payments
+
+## Quick Start
+
+### 1. Clone Repository
+
+```bash
+git clone https://github.com/closetome-ai/Closetome
+cd Closetome/facilitator
+```
+
+### 2. Install Dependencies
+
+```bash
+npm install
+```
+
+### 3. Configure Environment
+
+Create a [.env](https://github.com/closetome-ai/Closetome/blob/main/facilitator/.env.example) file:
+
+```bash
+# Server Configuration
+PORT=3010
+
+# Solana Configuration
+SOLANA_FEE_PAYER_SECRET_KEY=your_base58_encoded_secret_key_here
+
+# Compute Budget Settings (optional)
+SOLANA_COMPUTE_UNIT_PRICE=1
+SOLANA_COMPUTE_UNIT_LIMIT=40000
+SOLANA_MAX_COMPUTE_UNIT_LIMIT_ATOMIC=1000000
+```
+
+<Warning>
+**Security**: Never commit your `.env` file. Keep your secret keys secure and use environment-specific configurations for production.
+</Warning>
+
+### 4. Generate Keypair (Optional)
+
+If you don't have a keypair, generate one:
+
+```bash
+# Using Solana CLI
+solana-keygen new --outfile facilitator-keypair.json
+
+# Get base58 encoded key
+solana-keygen pubkey facilitator-keypair.json
+# Copy the secret key array and encode to base58
+```
+
+Or use the provided script:
+
+```bash
+npm run generate-keypair
+```
+
+### 5. Start Facilitator
+
+```bash
+# Development
+npm run dev
+
+# Production
+npm run build
+npm start
+```
+
+The facilitator will start on `http://localhost:3010` (or your configured PORT).
+
+## Configuration Options
+
+### Fee Payer Configuration
+
+The fee payer account signs and pays for transactions submitted to the Solana network.
+
+```env
+SOLANA_FEE_PAYER_SECRET_KEY=base58_encoded_secret_key
+```
+
+**Requirements**:
+- Must have sufficient SOL balance for transaction fees
+- For atomic transactions, this key will co-sign the transaction with the user
+
+### Compute Budget Settings
+
+Control transaction compute units and priority fees:
+
+```env
+# Priority fee in microLamports per compute unit
+SOLANA_COMPUTE_UNIT_PRICE=1
+
+# Default compute unit limit for transactions
+SOLANA_COMPUTE_UNIT_LIMIT=40000
+
+# Maximum compute limit for atomic transactions (anti-griefing)
+SOLANA_MAX_COMPUTE_UNIT_LIMIT_ATOMIC=1000000
+```
+
+<Info>
+**Anti-Griefing Protection**: The `MAX_COMPUTE_UNIT_LIMIT_ATOMIC` setting prevents malicious servers from creating atomic transactions with excessive callback instructions that would burn user's SOL in gas fees.
+</Info>
+
+## API Endpoints
+
+### GET /supported-kinds
+
+Returns supported payment networks and configurations.
+
+**Response**:
+```json
+{
+  "kinds": [
+    {
+      "x402Version": 1,
+      "scheme": "exact",
+      "network": "solana",
+      "extra": {
+        "feePayer": "FacilitatorPublicKey...",
+        "computeUnitPrice": 1,
+        "computeUnitLimit": 40000
+      }
+    },
+    {
+      "x402Version": 1,
+      "scheme": "exact",
+      "network": "solana-devnet",
+      "extra": { ... }
+    }
+  ]
+}
+```
+
+### POST /verify
+
+Verify a payment transaction without settling it.
+
+**Request**:
+```json
+{
+  "x402Version": 1,
+  "paymentPayload": {
+    "transaction": "base64_encoded_transaction"
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "solana-devnet",
+    "maxAmountRequired": "1000000",
+    "payTo": "RecipientPublicKey...",
+    "asset": "USDC",
+    ...
+  }
+}
+```
+
+**Response**:
+```json
+{
+  "isValid": true
+}
+```
+
+### POST /settle
+
+Verify and submit a standard payment transaction to the blockchain.
+
+**Request**: Same as `/verify`
+
+**Response**:
+```json
+{
+  "success": true,
+  "transactionHash": "5k2g8h..."
+}
+```
+
+### POST /atomic/verify
+
+Verify an atomic payment transaction (payment + callback instructions).
+
+**Additional validation**:
+- Verifies callback instructions match requirements exactly
+- Validates compute unit limits
+- Checks instruction order
+- Ensures no security violations
+
+### POST /atomic/settle
+
+Verify, co-sign, and submit an atomic transaction.
+
+**Flow**:
+1. Verifies all payment and callback instructions
+2. Co-signs transaction with facilitator keypair
+3. Submits to Solana network
+4. Returns transaction hash
+
+## Architecture
+
+### Service Layer
+
+The [SolanaService](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts) handles all Solana-specific logic:
+
+```typescript
+export class SolanaService {
+  // Standard payment verification
+  async verifyPayment(
+    paymentPayload: PaymentPayload,
+    requirements: PaymentRequirements
+  ): Promise<boolean>
+
+  // Standard payment settlement
+  async settlePayment(
+    paymentPayload: PaymentPayload,
+    requirements: PaymentRequirements
+  ): Promise<{ success: boolean; transactionHash?: string }>
+
+  // Atomic payment verification
+  async verifyAtomicPayment(
+    paymentPayload: PaymentPayload,
+    requirements: PaymentRequirements
+  ): Promise<boolean>
+
+  // Atomic payment settlement
+  async settleAtomicPayment(
+    paymentPayload: PaymentPayload,
+    requirements: PaymentRequirements
+  ): Promise<{ success: boolean; transactionHash?: string }>
+}
+```
+
+### Route Handlers
+
+#### Standard Routes
+
+- [/verify](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/routes/verify.ts) - Payment verification
+- [/settle](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/routes/settle.ts) - Payment settlement
+
+#### Atomic Routes
+
+- [/atomic/verify](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/routes/atomicVerify.ts) - Atomic verification
+- [/atomic/settle](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/routes/atomicSettle.ts) - Atomic settlement
+
+## Verification Logic
+
+### Standard Payment Verification
+
+Located in [solanaService.ts:271-452](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts#L271-L452)
+
+**Checks**:
+1. Parse and deserialize Solana transaction
+2. Validate compute budget instructions (if present)
+3. Verify USDC transfer instruction exists
+4. Check transfer amount meets requirements
+5. Validate transfer destination matches `payTo`
+6. Verify ATA creation instruction (if needed)
+
+```typescript
+// Key validation steps
+const instructions = this.decompileInstructions(message)
+
+// Find transfer instruction
+let transferDetails = this.parseUSDCTransferInstruction(instruction)
+
+// Validate amount
+if (transferDetails.amount < requiredAmount) {
+  return false
+}
+
+// Validate destination
+const expectedATA = await getAssociatedTokenAddress(usdcMint, recipient)
+if (!expectedATA.equals(transferDetails.destination)) {
+  return false
+}
+```
+
+### Atomic Payment Verification
+
+Located in [solanaService.ts:680-965](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts#L680-L965)
+
+**Additional checks beyond standard verification**:
+1. Validate compute unit limit doesn't exceed maximum (anti-griefing)
+2. Verify all callback instructions are present
+3. Check callback instructions match requirements exactly
+4. Validate instruction order (compute → ATA → transfer → callbacks)
+5. Ensure no extra or missing instructions
+
+```typescript
+// Critical: Compute unit limit check
+if (foundUnitLimit > this.maxComputeUnitLimitAtomic) {
+  console.error('Compute unit limit exceeds maximum')
+  console.error('This protects users from malicious servers')
+  return false
+}
+
+// Verify callback instructions match exactly
+for (const callbackIx of callbackInstructions) {
+  let found = false
+  for (const txIx of instructions) {
+    if (this.instructionsEqual(callbackIx, txIx)) {
+      found = true
+      break
+    }
+  }
+  if (!found) {
+    return false
+  }
+}
+
+// Validate instruction order
+const remainingInstructions = instructions.slice(currentIndex)
+if (remainingInstructions.length !== callbackInstructions.length) {
+  return false
+}
+```
+
+## Security Considerations
+
+### 1. Compute Unit Limit Protection
+
+```typescript
+// solanaService.ts:35-36
+private maxComputeUnitLimitAtomic: number = 1000000
+```
+
+Prevents servers from creating transactions with excessive compute requirements that would burn user's SOL.
+
+### 2. Instruction Equality Verification
+
+```typescript
+// solanaService.ts:646-675
+private instructionsEqual(ix1: TransactionInstruction, ix2: TransactionInstruction): boolean {
+  // Compare programId, keys, and data
+  // Special handling for signer accounts (Solana forces isWritable=true)
+  if (!key1.isSigner && !key2.isSigner) {
+    if (key1.isWritable !== key2.isWritable) return false
+  }
+}
+```
+
+Accounts for Solana's automatic modification of signer accounts during transaction compilation.
+
+### 3. Fee Payer Key Management
+
+<Warning>
+**Production Security**:
+- Store fee payer keys in secure key management systems (AWS KMS, HashiCorp Vault, etc.)
+- Use environment-specific keys (dev/staging/prod)
+- Implement key rotation policies
+- Monitor key usage and set up alerts
+- Use dedicated accounts for fee payment only
+</Warning>
+
+## Monitoring and Logging
+
+The facilitator logs key events:
+
+```typescript
+console.log('✅ Payment verification successful')
+console.log('💰 Payment settled:', txHash)
+console.log('🔍 Verifying atomic transaction...')
+console.log('⚠️ Compute unit limit exceeds maximum')
+```
+
+**Recommended monitoring**:
+- Transaction success/failure rates
+- Verification time metrics
+- Solana RPC health
+- Fee payer SOL balance
+- Error rate by error type
+
+## Production Deployment
+
+### 1. Infrastructure Setup
+
+```bash
+# Use process managers for reliability
+pm2 start npm --name "closetome-facilitator" -- start
+
+# Or with systemd
+sudo systemctl enable closetome-facilitator
+sudo systemctl start closetome-facilitator
+```
+
+### 2. Load Balancing
+
+Deploy multiple facilitator instances behind a load balancer:
+
+```
+                     ┌──> Facilitator 1 (solana mainnet)
+                     │
+Client → Load Balancer ──> Facilitator 2 (solana mainnet)
+                     │
+                     └──> Facilitator 3 (solana devnet)
+```
+
+### 3. RPC Configuration
+
+Use reliable Solana RPC endpoints:
+
+```typescript
+// For production, use dedicated RPC providers
+const rpcUrl = process.env.SOLANA_RPC_URL || 'https://your-rpc-provider.com'
+```
+
+**Recommended providers**:
+- Helius
+- QuickNode
+- Triton
+- GenesysGo
+
+### 4. Error Handling
+
+Implement retry logic and fallbacks:
+
+```typescript
+try {
+  const signature = await this.connection.sendTransaction(transaction)
+  await this.connection.confirmTransaction(signature)
+} catch (error) {
+  // Log error
+  // Retry with exponential backoff
+  // Fall back to alternative RPC
+}
+```
+
+## Testing
+
+### Unit Tests
+
+```bash
+npm test
+```
+
+### Integration Tests
+
+```bash
+# Start facilitator
+npm run dev
+
+# In another terminal, run test client
+cd ../examples/client
+npm run atomic-client
+```
+
+### Testnet Testing
+
+1. Use devnet for testing:
+```env
+# .env
+SOLANA_RPC_URL=https://api.devnet.solana.com
+```
+
+2. Get devnet USDC:
+```bash
+# Devnet USDC mint: Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr
+```
+
+3. Airdrop devnet SOL:
+```bash
+solana airdrop 1 <your-address> --url devnet
+```
+
+## Troubleshooting
+
+### "Fee payer not configured"
+
+**Solution**: Set `SOLANA_FEE_PAYER_SECRET_KEY` in your `.env` file.
+
+### "Insufficient balance"
+
+**Solution**: Ensure fee payer account has enough SOL for transaction fees (0.000005 SOL per transaction typically).
+
+### "Transaction simulation failed"
+
+**Causes**:
+- Invalid instruction data
+- Insufficient token balance
+- Account not initialized
+
+**Solution**: Check transaction logs and verify all accounts exist and have sufficient balances.
+
+### "Compute unit limit exceeded"
+
+**Solution**: Adjust `SOLANA_MAX_COMPUTE_UNIT_LIMIT_ATOMIC` in configuration, but be cautious of griefing risks.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="SDK Integration"
+    icon="code"
+    href="/integration/sdk-guide"
+  >
+    Integrate atomic payments in your app
+  </Card>
+  <Card
+    title="Atomic Implementation"
+    icon="diagram-project"
+    href="/core/atomic-implementation"
+  >
+    Understand the atomic architecture
+  </Card>
+</CardGroup>
+
+## Source Code
+
+- [Facilitator Server](https://github.com/closetome-ai/closetome-facilitator/tree/main/facilitator)
+- [Solana Service Implementation](https://github.com/closetome-ai/closetome-facilitator/blob/main/facilitator/src/services/solanaService.ts)
+- [Route Handlers](https://github.com/closetome-ai/closetome-facilitator/tree/main/facilitator/src/routes)

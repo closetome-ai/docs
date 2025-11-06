@@ -1,0 +1,775 @@
+---
+title: SDK Integration Guide
+description: Integrate Closetome payments into your application
+icon: "code"
+---
+
+## Overview
+
+The Closetome SDK provides both **server** and **client** components for implementing X402 payments with atomic transaction support.
+
+## Installation
+
+```bash
+npm install @closetome/solana-sdk
+```
+
+<Note>
+**Currently Supported**: Solana mainnet and devnet. EVM support (Base, Ethereum) coming soon.
+</Note>
+
+## Server Integration
+
+### Quick Start
+
+Create an Express server with X402 payment protection:
+
+```typescript
+import express from 'express'
+import { createX402Middleware, defineRoute, prop } from '@closetome/solana-sdk'
+import { Keypair, TransactionInstruction, PublicKey } from '@solana/web3.js'
+
+const app = express()
+
+// Server keypair for signing atomic transactions
+const serverKeypair = Keypair.generate()
+
+// Define an atomic payment route
+const atomicRoute = defineRoute({
+  method: 'GET',
+  path: '/api/premium',
+  atomic: true,
+  autoSettle: true,
+
+  // Input schema for client discovery
+  inputSchema: {
+    amount: prop.number('Payment amount in USDC'),
+    message: prop.string('Custom message')
+  },
+
+  // Payment requirements generator
+  paymentRequirements: ({ input }) => ({
+    maxAmountRequired: input.amount?.toString() || '1000000',
+    payTo: serverKeypair.publicKey.toBase58(),
+    description: 'Premium API access',
+    extra: {
+      callbackInstructions: [
+        // Define on-chain operations to execute atomically with payment
+        new TransactionInstruction({
+          keys: [{
+            pubkey: serverKeypair.publicKey,
+            isSigner: true,
+            isWritable: false
+          }],
+          programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+          data: Buffer.from(`Payment: ${input.message}`)
+        })
+      ]
+    }
+  }),
+
+  // Handler executed after successful payment
+  handler: ({ input, req }) => {
+    return {
+      message: 'Payment successful!',
+      data: { amount: input.amount, message: input.message }
+    }
+  }
+})
+
+// Create X402 middleware
+const x402 = createX402Middleware({
+  network: 'solana-devnet',
+  facilitatorUrl: 'http://localhost:3010',
+  routes: [atomicRoute],
+  serverKeypair: serverKeypair.secretKey
+})
+
+app.use(x402)
+app.listen(4000)
+```
+
+### Route Configuration
+
+#### Standard X402 Route
+
+For simple payment verification without callbacks:
+
+```typescript
+const standardRoute = {
+  path: '/api/protected',
+  paymentRequirements: {
+    maxAmountRequired: '1000000', // 1 USDC
+    payTo: 'YourWalletAddress...',
+    description: 'Protected resource access'
+  },
+  autoSettle: true,
+
+  onPaymentVerified: async (payment, req) => {
+    console.log('Payment verified:', payment)
+  },
+
+  onPaymentSettled: async (payment, txHash, req) => {
+    console.log('Payment settled:', txHash)
+  }
+}
+```
+
+#### Atomic X402 Route
+
+For atomic payment + callback execution:
+
+```typescript
+import { defineRoute, prop, serializeInstructions } from '@closetome/solana-sdk'
+
+const atomicRoute = defineRoute<InputType, OutputType>({
+  method: 'GET',
+  path: '/api/atomic/endpoint',
+  atomic: true,        // Enable atomic verification
+  autoSettle: true,    // Auto-settle after verification
+  discoverable: true,  // Allow schema discovery
+
+  // Input schema for API documentation
+  inputSchema: {
+    userId: prop.string('User identifier', { required: true }),
+    amount: prop.number('Payment amount in microUSDC'),
+    metadata: prop.object({
+      key: prop.string('Metadata key'),
+      value: prop.string('Metadata value')
+    }, 'Additional metadata')
+  },
+
+  // Output schema for API documentation
+  outputSchema: {
+    success: prop.boolean('Operation success status'),
+    transactionHash: prop.string('Solana transaction hash'),
+    data: prop.object({
+      userId: prop.string('User ID'),
+      timestamp: prop.number('Unix timestamp')
+    }, 'Response data')
+  },
+
+  // Dynamic payment requirements based on input
+  paymentRequirements: ({ input, req }) => {
+    // Calculate dynamic pricing
+    const baseAmount = 1000000 // 1 USDC
+    const amount = input.amount || baseAmount
+
+    // Create callback instructions
+    const instructions = []
+
+    // Example: Write memo with user data
+    instructions.push(
+      new TransactionInstruction({
+        keys: [{
+          pubkey: SERVER_KEYPAIR.publicKey,
+          isSigner: true,
+          isWritable: false
+        }],
+        programId: MEMO_PROGRAM_ID,
+        data: Buffer.from(`User: ${input.userId}`)
+      })
+    )
+
+    // Example: Conditional instruction based on amount
+    if (amount >= 5000000) { // >= 5 USDC
+      instructions.push(
+        new TransactionInstruction({
+          keys: [{
+            pubkey: SERVER_KEYPAIR.publicKey,
+            isSigner: true,
+            isWritable: false
+          }],
+          programId: MEMO_PROGRAM_ID,
+          data: Buffer.from('PREMIUM_TIER')
+        })
+      )
+    }
+
+    return {
+      maxAmountRequired: amount.toString(),
+      payTo: PAYMENT_RECIPIENT,
+      description: `API access for ${input.userId}`,
+      resource: req.path,
+      extra: {
+        callbackInstructions: serializeInstructions(instructions)
+      }
+    }
+  },
+
+  // Request handler with type safety
+  handler: ({ input, req, res }) => {
+    const paymentInfo = req.x402
+
+    return {
+      success: true,
+      transactionHash: paymentInfo.settlementTxHash,
+      data: {
+        userId: input.userId,
+        timestamp: Date.now()
+      }
+    }
+  }
+})
+```
+
+### Middleware Configuration
+
+```typescript
+import { createX402Middleware } from '@closetome/solana-sdk'
+import bs58 from 'bs58'
+
+const x402Middleware = createX402Middleware({
+  // Network configuration
+  network: 'solana-devnet', // or 'solana' for mainnet
+
+  // Facilitator endpoint
+  facilitatorUrl: process.env.FACILITATOR_URL || 'http://localhost:3010',
+
+  // Route definitions
+  routes: [standardRoute, atomicRoute],
+
+  // Default payment recipient (optional)
+  defaultPayTo: 'YourWalletAddress...',
+
+  // Server keypair for atomic transactions (required for atomic routes)
+  serverKeypair: bs58.encode(keypair.secretKey),
+
+  // Error handler (optional)
+  onPaymentFailed: async (error, req) => {
+    console.error('Payment failed:', error.message, 'for', req.path)
+    // Log to monitoring service, send alerts, etc.
+  }
+})
+
+app.use(x402Middleware)
+```
+
+### Request Context
+
+After successful payment, the request object contains payment information:
+
+```typescript
+app.get('/api/protected', (req, res) => {
+  const paymentInfo = req.x402
+
+  if (paymentInfo) {
+    console.log('Payment settled:', paymentInfo.settled)
+    console.log('Transaction hash:', paymentInfo.settlementTxHash)
+    console.log('Atomic transaction:', paymentInfo.atomic)
+  }
+
+  res.json({ message: 'Success' })
+})
+```
+
+## Client Integration
+
+### Basic Client
+
+```typescript
+import { X402Client } from '@closetome/solana-sdk'
+import { Keypair } from '@solana/web3.js'
+
+// Initialize client
+const client = new X402Client({
+  serverUrl: 'http://localhost:4000',
+  payerKeypair: Keypair.fromSecretKey(secretKey),
+  network: 'solana-devnet'
+})
+
+// Standard payment request
+const result = await client.requestWithPayment('/api/protected')
+console.log(result)
+
+// Atomic payment request
+const atomicResult = await client.requestWithAtomicPayment('/api/premium?amount=1000000')
+console.log(atomicResult)
+```
+
+### Interactive Client with Schema Discovery
+
+```typescript
+import { X402Client } from '@closetome/solana-sdk'
+
+async function interactiveRequest() {
+  const client = new X402Client({
+    serverUrl: 'http://localhost:4000',
+    payerKeypair: yourKeypair,
+    network: 'solana-devnet'
+  })
+
+  // Step 1: Discover API schema
+  const endpoint = '/api/atomic/premium'
+  const requirements = await client.getPaymentRequirements(endpoint)
+
+  if (!requirements?.outputSchema) {
+    console.log('No schema available')
+    return
+  }
+
+  const inputSchema = requirements.outputSchema.input
+
+  // Step 2: Display available parameters
+  console.log('Available parameters:')
+  for (const [key, schema] of Object.entries(inputSchema.properties || {})) {
+    console.log(`  ${key}: ${schema.type} - ${schema.description}`)
+  }
+
+  // Step 3: Collect user input
+  const userInput = {
+    amount: 1000000,
+    message: 'Hello World',
+    premium: 'true'
+  }
+
+  // Step 4: Build request URL
+  const params = new URLSearchParams(userInput)
+  const finalEndpoint = `${endpoint}?${params}`
+
+  // Step 5: Execute atomic payment
+  const result = await client.requestWithAtomicPayment(finalEndpoint)
+  console.log('Success:', result)
+}
+```
+
+### Security Validation
+
+The SDK automatically validates callback instructions:
+
+```typescript
+// Automatically checked in client.ts:221-234
+private validateCallbackInstructions(callbackInstructions: SerializedInstruction[]): void {
+  const userWallet = this.payer.publicKey.toBase58()
+
+  for (const instruction of callbackInstructions) {
+    for (const key of instruction.keys) {
+      if (key.pubkey === userWallet) {
+        throw new Error(
+          'Security violation: Callback instruction contains user wallet. ' +
+          'This could allow server to access your funds.'
+        )
+      }
+    }
+  }
+}
+```
+
+This prevents malicious servers from including your wallet in callback instructions.
+
+## Type-Safe Schema System
+
+### Property Builders
+
+```typescript
+import { prop } from '@closetome/solana-sdk'
+
+// String property
+prop.string('User identifier')
+prop.string('Status', { enum: ['active', 'inactive'] })
+
+// Number property
+prop.number('Amount in USDC')
+
+// Boolean property
+prop.boolean('Premium access flag')
+
+// Object property
+prop.object({
+  name: prop.string('Name'),
+  age: prop.number('Age')
+}, 'User information')
+
+// Array property
+prop.array(
+  prop.string('Tag'),
+  'List of tags'
+)
+```
+
+### Schema Example
+
+```typescript
+const inputSchema = {
+  userId: prop.string('User identifier', { required: true }),
+  amount: prop.number('Payment amount in microUSDC'),
+  premium: prop.string('Premium tier', {
+    enum: ['basic', 'pro', 'enterprise']
+  }),
+  metadata: prop.object({
+    source: prop.string('Request source'),
+    timestamp: prop.number('Request timestamp')
+  }, 'Request metadata'),
+  tags: prop.array(
+    prop.string('Tag value'),
+    'Associated tags'
+  )
+}
+```
+
+## Instruction Serialization
+
+### Creating Callback Instructions
+
+```typescript
+import { TransactionInstruction, PublicKey } from '@solana/web3.js'
+import { serializeInstructions } from '@closetome/solana-sdk'
+
+// Create instructions
+const instructions = [
+  // Memo instruction
+  new TransactionInstruction({
+    keys: [{
+      pubkey: serverPublicKey,
+      isSigner: true,
+      isWritable: false
+    }],
+    programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+    data: Buffer.from('Payment processed')
+  }),
+
+  // Custom program instruction
+  new TransactionInstruction({
+    keys: [
+      { pubkey: account1, isSigner: false, isWritable: true },
+      { pubkey: account2, isSigner: false, isWritable: false }
+    ],
+    programId: customProgramId,
+    data: instructionData
+  })
+]
+
+// Serialize for transmission
+const serialized = serializeInstructions(instructions)
+
+// Include in payment requirements
+return {
+  maxAmountRequired: '1000000',
+  extra: {
+    callbackInstructions: serialized
+  }
+}
+```
+
+## Complete Example
+
+See the [example server](https://github.com/closetome-ai/closetome-facilitator/blob/main/examples/server/server.ts) and [example client](https://github.com/closetome-ai/closetome-facilitator/blob/main/examples/client/atomic-client.ts) for complete working implementations.
+
+### Server Example
+
+```typescript
+import express from 'express'
+import {
+  createX402Middleware,
+  defineRoute,
+  createTypedRoute,
+  createTypedHandlers,
+  prop,
+  serializeInstructions
+} from '@closetome/solana-sdk'
+import { Keypair, PublicKey, TransactionInstruction } from '@solana/web3.js'
+import bs58 from 'bs58'
+
+const app = express()
+app.use(express.json())
+
+const SERVER_ACCOUNT = Keypair.fromSecretKey(
+  bs58.decode(process.env.SERVER_SECRET_KEY)
+)
+const PAYMENT_RECIPIENT = process.env.PAYMENT_RECIPIENT
+
+// Type definitions
+interface PremiumInput {
+  amount?: number
+  message?: string
+  premium?: 'true' | 'false'
+}
+
+interface PremiumOutput {
+  message: string
+  payment: {
+    settlementTxHash: string
+    atomic: boolean
+  }
+}
+
+// Define atomic route
+const atomicPremiumRoute = defineRoute<PremiumInput, PremiumOutput>({
+  method: 'GET',
+  path: '/api/atomic/premium',
+  atomic: true,
+  autoSettle: true,
+
+  inputSchema: {
+    amount: prop.number('Payment amount in microUSDC'),
+    message: prop.string('Custom message'),
+    premium: prop.string('Premium flag', { enum: ['true', 'false'] })
+  },
+
+  outputSchema: {
+    message: prop.string('Response message'),
+    payment: prop.object({
+      settlementTxHash: prop.string('Transaction hash'),
+      atomic: prop.boolean('Atomic transaction')
+    }, 'Payment info')
+  },
+
+  paymentRequirements: ({ input }) => {
+    const amount = input.amount || 1000000
+    const customMessage = input.message || 'Default payment'
+
+    const callbackInstructions = []
+
+    // Main memo
+    callbackInstructions.push(
+      new TransactionInstruction({
+        keys: [{
+          pubkey: SERVER_ACCOUNT.publicKey,
+          isSigner: true,
+          isWritable: false
+        }],
+        programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+        data: Buffer.from(`X402: ${customMessage}`)
+      })
+    )
+
+    // Conditional premium instruction
+    if (input.premium === 'true') {
+      callbackInstructions.push(
+        new TransactionInstruction({
+          keys: [{
+            pubkey: SERVER_ACCOUNT.publicKey,
+            isSigner: true,
+            isWritable: false
+          }],
+          programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+          data: Buffer.from('PREMIUM_ACCESS')
+        })
+      )
+    }
+
+    return {
+      maxAmountRequired: amount.toString(),
+      payTo: PAYMENT_RECIPIENT,
+      description: `Premium API - ${customMessage}`,
+      resource: '/api/atomic/premium',
+      extra: {
+        callbackInstructions: serializeInstructions(callbackInstructions)
+      }
+    }
+  },
+
+  handler: ({ input, req }) => {
+    const x402Info = req.x402
+
+    return {
+      message: 'Atomic payment successful!',
+      payment: {
+        settlementTxHash: x402Info.settlementTxHash,
+        atomic: true
+      }
+    }
+  }
+})
+
+// Setup middleware
+const x402Middleware = createX402Middleware({
+  network: 'solana-devnet',
+  facilitatorUrl: 'http://localhost:3010',
+  routes: [createTypedRoute(atomicPremiumRoute)],
+  defaultPayTo: PAYMENT_RECIPIENT,
+  serverKeypair: bs58.encode(SERVER_ACCOUNT.secretKey),
+  onPaymentFailed: async (error, req) => {
+    console.error('Payment failed:', req.path, error.message)
+  }
+})
+
+app.use(x402Middleware)
+
+// Register handler
+const atomicHandlers = createTypedHandlers(atomicPremiumRoute)
+app.get('/api/atomic/premium', atomicHandlers.handler)
+
+app.listen(4000, () => {
+  console.log('Server running on http://localhost:4000')
+})
+```
+
+### Client Example
+
+```typescript
+import { X402Client } from '@closetome/solana-sdk'
+import { Keypair } from '@solana/web3.js'
+import bs58 from 'bs58'
+
+async function main() {
+  // Load payer keypair
+  const payerKeypair = Keypair.fromSecretKey(
+    bs58.decode(process.env.PAYER_SECRET_KEY)
+  )
+
+  // Create client
+  const client = new X402Client({
+    serverUrl: 'http://localhost:4000',
+    payerKeypair: payerKeypair,
+    network: 'solana-devnet'
+  })
+
+  console.log('Payer:', client.getPayerPublicKey())
+
+  // Discover schema
+  const endpoint = '/api/atomic/premium'
+  const requirements = await client.getPaymentRequirements(endpoint)
+
+  if (requirements?.outputSchema) {
+    console.log('Input parameters:')
+    console.log(requirements.outputSchema.input.properties)
+  }
+
+  // Make atomic payment request
+  const finalEndpoint = `${endpoint}?amount=1000000&message=Hello&premium=true`
+  const result = await client.requestWithAtomicPayment(finalEndpoint)
+
+  console.log('Success:', result)
+  console.log('Transaction:', result.payment.settlementTxHash)
+}
+
+main().catch(console.error)
+```
+
+## Testing
+
+### Unit Tests
+
+```typescript
+import { X402Client } from '@closetome/solana-sdk'
+import { Keypair } from '@solana/web3.js'
+
+describe('X402 Atomic Payments', () => {
+  it('should create atomic transaction', async () => {
+    const client = new X402Client({
+      serverUrl: 'http://localhost:4000',
+      payerKeypair: Keypair.generate(),
+      network: 'solana-devnet'
+    })
+
+    const requirements = {
+      scheme: 'exact',
+      network: 'solana-devnet',
+      maxAmountRequired: '1000000',
+      payTo: 'RecipientAddress...',
+      extra: {
+        callbackInstructions: [/* ... */]
+      }
+    }
+
+    const tx = await client.createAtomicPaymentTransaction(requirements)
+    expect(tx).toBeDefined()
+    expect(typeof tx).toBe('string')
+  })
+})
+```
+
+### Integration Tests
+
+Start facilitator and server, then run client tests:
+
+```bash
+# Terminal 1: Start facilitator
+cd facilitator && npm run dev
+
+# Terminal 2: Start example server
+cd examples/server && npm run dev
+
+# Terminal 3: Run client
+cd examples/client && npm run atomic-client
+```
+
+## Best Practices
+
+### 1. Validate User Inputs
+
+```typescript
+paymentRequirements: ({ input }) => {
+  // Validate and sanitize inputs
+  const amount = Math.max(1000000, Math.min(input.amount || 1000000, 100000000))
+  const message = (input.message || '').slice(0, 100) // Limit length
+
+  return { maxAmountRequired: amount.toString(), ... }
+}
+```
+
+### 2. Handle Errors Gracefully
+
+```typescript
+try {
+  const result = await client.requestWithAtomicPayment(endpoint)
+  console.log('Success:', result)
+} catch (error) {
+  if (error.response?.status === 402) {
+    console.error('Payment required but failed')
+  } else if (error.message.includes('Security violation')) {
+    console.error('Server attempted to include user wallet in callback')
+  } else {
+    console.error('Unexpected error:', error)
+  }
+}
+```
+
+### 3. Implement Monitoring
+
+```typescript
+createX402Middleware({
+  // ...
+  onPaymentFailed: async (error, req) => {
+    // Log to monitoring service
+    logger.error('Payment failed', {
+      path: req.path,
+      error: error.message,
+      timestamp: Date.now()
+    })
+
+    // Send alert if critical
+    if (error.message.includes('facilitator unavailable')) {
+      alerting.sendAlert('Facilitator down')
+    }
+  }
+})
+```
+
+### 4. Use Environment Variables
+
+```typescript
+const config = {
+  network: process.env.SOLANA_NETWORK || 'solana-devnet',
+  facilitatorUrl: process.env.FACILITATOR_URL || 'http://localhost:3010',
+  serverKeypair: process.env.SERVER_SECRET_KEY,
+  defaultPayTo: process.env.PAYMENT_RECIPIENT
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Atomic Implementation"
+    icon="diagram-project"
+    href="/core/atomic-implementation"
+  >
+    Deep dive into atomic architecture
+  </Card>
+  <Card
+    title="Facilitator Setup"
+    icon="server"
+    href="/integration/facilitator-setup"
+  >
+    Deploy your own facilitator
+  </Card>
+</CardGroup>
+
+## Source Code
+
+- [SDK Source](https://github.com/closetome-ai/closetome-facilitator/tree/main/solana-sdk)
+- [Example Server](https://github.com/closetome-ai/closetome-facilitator/blob/main/examples/server/server.ts)
+- [Example Client](https://github.com/closetome-ai/closetome-facilitator/blob/main/examples/client/atomic-client.ts)
+- [Type Definitions](https://github.com/closetome-ai/closetome-facilitator/blob/main/solana-sdk/src/types.ts)
